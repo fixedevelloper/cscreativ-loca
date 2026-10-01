@@ -1,0 +1,1121 @@
+================================================================================
+MISE A JOUR DE L'AUDIT - 2026-10-01
+(l'audit initial du 2026-09-16 est conserve integralement plus bas)
+Perimetre : re-verification du code actuel (Laravel 12.32 + Next.js 16).
+Rien n'a ete execute hormis "php artisan route:list" ; node_modules absent
+cote frontend (tsc non lance).
+================================================================================
+
+SYNTHESE
+Gros progres depuis le 16/09, mais le parcours principal est casse de bout
+en bout (un nouveau bailleur ne peut pas s'abonner, donc ne peut rien faire)
+et il reste deux failles d'acces aux documents permettant de lire les
+donnees personnelles d'autres clients. Aucun test automatise.
+(Correctif : Frontend/ et locative/ ont chacun leur propre depot git ; seule
+la racine n'en avait pas.)
+
+--------------------------------------------------------------------------------
+1. POINTS DE L'AUDIT DU 16/09 - STATUT
+--------------------------------------------------------------------------------
+CORRIGES : #1 (mock paiement limite a local/testing), #2 (role force a
+owner), #3 (alias role), #4 (catalogue config/plans.php), #5 (confirm
+scope + re-verification MoMo), #6 (secret NextAuth), #7 et #9 (policies +
+scopes visibleTo), #10 cote backend (disque prive), #11 (code copie
+nettoye), #12 (MomoCallbackController cree - mais voir B6), #13 (soft
+deletes + FK restrict), #14 (route pro desactivee), F1 (proxy.ts), F6
+(headers + CSP nonce). Ajouts : throttle login, CORS, generation
+mensuelle des loyers, relances J+3/J+7/J+15 + penalites, quittances PDF,
+dashboard reel, AgentController.
+PARTIELS : #8 (flux d'invitation code mais casse, voir B4), #10 cote
+frontend (voir B9), #15/#16 (voir B8), F5 (voir S6).
+
+--------------------------------------------------------------------------------
+2. FAILLES DE SECURITE CRITIQUES (NOUVELLES)
+--------------------------------------------------------------------------------
+S1  DocumentController::download
+    Pour un locataire, "$document->is_shared" suffit a autoriser, sans
+    verifier le contrat. Toutes les quittances sont creees is_shared=true.
+    -> N'importe quel locataire telecharge les quittances/documents
+       partages de TOUS les locataires de la plateforme (enumeration d'id).
+
+S2  DocumentController::store + Jobs/GenerateContractPdf
+    contract_id valide par "exists" seulement. Avec type=contract, le job
+    genere le PDF du contrat d'un AUTRE client et l'attache au document
+    de l'attaquant.
+    -> Exfiltration du bail de n'importe quel client + injection de
+       documents dans l'espace de la victime.
+
+S3  DocumentController::index / download
+    Un agent voit et telecharge TOUS les documents, pas seulement ceux des
+    bailleurs qui lui sont rattaches.
+
+S4  Service/MomoService.php
+    logger($token) et log du body complet : token d'acces MoMo en clair
+    dans les logs.
+
+S5  Frontend options.ts + axiosServices.ts
+    NextAuth logue result.data (contient le token API) ; l'intercepteur
+    Axios logue le corps de chaque requete (mots de passe) dans la
+    console du navigateur.
+
+S6  config/sanctum.php (expiration => null) + frontend
+    Tokens Sanctum sans expiration ; signOut() n'appelle pas /api/logout ;
+    token toujours expose cote client (session.token + fallback
+    localStorage).
+
+--------------------------------------------------------------------------------
+3. BUGS BLOQUANTS
+--------------------------------------------------------------------------------
+B1  Abonnement impossible : le front envoie plan_name "Free|Pro|Agency"
+    alors que le backend attend "free|starter|pro|agency" -> 422. Le
+    front attend data.data.payment_url (n'existe plus) et n'appelle jamais
+    /subscription-payments/initiate ni /subscriptions/confirm. Catalogue
+    du front (prix en $, limites) different de config/plans.php.
+B2  Plan Agency -> 500 : limites null inserees dans property_limit /
+    tenant_limit NOT NULL.
+B3  Annulation -> 500 : status 'cancelled' absent de l'enum
+    (active, pending, expired).
+B4  Creation de locataire -> 500 systematique : Password::sendResetLink
+    exige la route 'password.reset' qui n'existe pas -> rollback. Aucun
+    endpoint/page de definition du mot de passe.
+B5  SubscriptionMiddleware ne laisse passer que les admins : locataires
+    et agents (jamais abonnes) recoivent 403 partout -> portails
+    inutilisables.
+B6  Webhook /momo/callback declare dans web.php -> CSRF -> 419 pour MoMo.
+    MOMO_CALLBACK_URL (.env) pointe vers /api/momo/callback et n'est
+    jamais lu.
+B7  Recherche -> 500 : Tenant/Contract cherchent sur name/city/address
+    (colonnes inexistantes) ; Payment sur rents.reference et relation
+    rent.property inexistantes.
+B8  apiResource sans methodes : show/update/destroy Property et Contract,
+    update/destroy Inventory, show/update Document -> 500. Stubs vides
+    (200 sans effet) : update/destroy Tenant, Rent, Payment.
+    PaymentList.tsx appelle tenantService.remove(payment.id).
+B9  DocumentList.tsx pointe vers /storage/{file_path} : fichiers prives
+    -> liens casses. Passer par /api/documents/{id}/download.
+
+--------------------------------------------------------------------------------
+4. PROBLEMES IMPORTANTS
+--------------------------------------------------------------------------------
+- Limites de plan : limite locataires non verifiee a la creation d'un
+  locataire (mais verifiee a la creation d'un bien). 
+  CheckSubscriptionLimitsMiddleware mort et casse ($user->subscription,
+  max_properties inexistants).
+- SubscriptionController::store expire l'abonnement actif AVANT paiement :
+  un upgrade echoue bloque l'utilisateur.
+- Paiements de loyer : sur-paiement possible, pas de lockForUpdate,
+  quittance regeneree en double a chaque paiement supplementaire.
+- GenerateRentForContract ignore end_date et periodic ; aucun job
+  d'expiration des contrats.
+- GenerateContractPdf ecrase file_path (fichier uploade orphelin) et le
+  PDF precedent du meme contrat.
+- shared_with absent de $fillable ; InventoryController::store :
+  "undefined key contract_id" si absent, contrat non verifie vs bien.
+- MomoService : prefixe 237 en dur, pas de timeout, token non cache,
+  $currency ignore, X-Target-Environment par defaut incoherent.
+- Frontend : tout 403 redirige vers /subscriptions ; getSession() a
+  chaque requete API ; intercepteurs enregistres plusieurs fois
+  (StrictMode) ; toutes les erreurs de login masquees.
+
+--------------------------------------------------------------------------------
+5. HYGIENE / INDUSTRIALISATION
+--------------------------------------------------------------------------------
+- Aucun test (ExampleTest uniquement) : plus gros risque structurel.
+- Git : un depot par projet (Frontend/, locative/), pas de depot racine.
+  Un depot racine a ete cree le 2026-10-01 (IDE ?) avec Frontend/ ajoute
+  comme gitlink : choisir monorepo OU deux depots, pas les deux.
+- .env backend : cles MoMo de PRODUCTION (bloc mtncameroon commente) en
+  clair -> a sortir et faire tourner si le fichier a circule.
+- APP_DEBUG=true : le bloc "debug" du handler expose les chemins.
+- Formats de reponse API heterogenes ; limit de pagination non plafonne.
+
+--------------------------------------------------------------------------------
+6. PLAN D'ACTION
+--------------------------------------------------------------------------------
+P0  S1-S3 : policy Document (download, store, index scope agent)   Faible
+P0  S4-S5 : supprimer logs de tokens / payloads                     Trivial
+P0  B1-B3 : catalogue via GET /plans, ecran initier -> confirmer,
+            limites nullable, enum 'cancelled'                      Moyen
+P0  B4-B5 : ResetPassword::createUrlUsing + endpoints/page reset,
+            acces tenant/agent sans abonnement propre               Moyen
+P1  B6 : webhook dans api.php                                       Trivial
+P1  B7-B9 : recherches, routes ->only(), download via API           Moyen
+P1  S6 : expiration Sanctum, /api/logout, retrait localStorage      Faible
+P1  Tests d'acces par role                                          Moyen
+P2  Section 4                                                       Moyen
+
+--------------------------------------------------------------------------------
+7. JOURNAL DES CORRECTIONS P0 (2026-10-01)
+--------------------------------------------------------------------------------
+S1-S3 CORRIGE  Policies/DocumentPolicy (view/share/delete) + scope
+               Document::visibleTo ; DocumentController utilise authorize()
+               partout ; un locataire ne voit un document partage que s'il
+               concerne SON contrat ; agent limite a ses bailleurs.
+               StoreDocumentRequest verifie contract_id et shared_with.* ;
+               generation du PDF de contrat reservee a ContractPolicy::update.
+S4    CORRIGE  MomoService : plus de token ni de body dans les logs.
+S5    CORRIGE  options.ts : logs de result.data supprimes ; axiosServices :
+               plus aucun corps de requete loggue, logs en dev uniquement.
+B1    CORRIGE  GET /api/plans (catalogue serveur) ; page Abonnements
+               reecrite : plans de l'API, choix -> initier MoMo (numero
+               9 chiffres, valide cote API) -> verifier le statut.
+               + abonnement actif conserve jusqu'a confirmation du paiement
+               (SubscriptionPayment::markAsSuccessful, activation
+               dedoublonnee dans confirm/callback/GetStatusMomo).
+B2-B3 CORRIGE  Migration 2026_10_01_090000 : limites nullable + enum
+               'cancelled'. A EXECUTER : php artisan migrate
+B4    CORRIGE  ResetPassword::createUrlUsing -> FRONTEND/auth/reset-password ;
+               POST /api/forgot-password et /api/reset-password
+               (PasswordResetController, revoque les tokens) ; pages
+               /auth/forgot-password et /auth/reset-password ; lien envoye
+               apres le commit, un echec d'envoi n'annule plus la creation.
+B5    CORRIGE  SubscriptionMiddleware : locataire autorise (hors
+               fonctionnalites de plan) ; agent couvert par l'abonnement
+               d'un bailleur gere ; TenantController verifie l'abonnement
+               du bailleur du bien. Scope Subscription::active +
+               User::activeSubscription().
+TESTS          tests/Feature/P0SecurityTest.php : 10 tests (34 assertions
+               avec la suite) verts. Migration du 16/09 rendue portable
+               SQLite (dropForeign par colonne, SQL MySQL identique).
+               ExampleTest (GET /) echouait deja : route / inexistante.
+NOTE           Le lien d'invitation expire apres 60 min (config/auth.php
+               passwords.users.expire) ; le locataire peut en redemander un
+               via "mot de passe oublie".
+
+--------------------------------------------------------------------------------
+8. JOURNAL DES CORRECTIONS P1 (2026-10-01)
+--------------------------------------------------------------------------------
+B6    CORRIGE  Webhook deplace dans routes/api.php (POST|PUT /api/momo/
+               callback, throttle 60/min, hors CSRF). X-Callback-Url =
+               MOMO_CALLBACK_URL (config services.momo.callback_url) sinon
+               route(). Variables MoMo documentees dans .env.example.
+B7    CORRIGE  Recherches : Tenant (nom/email/tel du user, nom du bien),
+               Contract (bien + nom du locataire), Payment (mois, bien,
+               locataire). Chargements anticipes ajoutes (tenant.user).
+               DocumentController::index pagine + recherche (format
+               ApiResponse attendu par le front).
+B8    CORRIGE  apiResource ->only() sur les actions implementees ; stubs
+               vides supprimes. DELETE /tenants/{id} implemente : bail
+               resilie, bien libere, fiche soft-deletee (TenantPolicy).
+               Pas de suppression de paiement (piece comptable) : code mort
+               retire de PaymentList.tsx. Methodes de services front
+               pointant vers des routes inexistantes supprimees.
+B9    CORRIGE  DocumentList : telechargement via /api/documents/{id}/download
+               (blob + token), bouton "Modifier" factice retire.
+S6    CORRIGE  Sanctum expiration = SANCTUM_EXPIRATION (1440 min, = session
+               NextAuth) + purge quotidienne sanctum:prune-expired. Logout
+               revoque le token courant seulement ; bouton Logout du front
+               appelle /api/logout avant signOut. Fallback localStorage
+               supprime. RESTE : le token transite toujours par getSession()
+               cote client (proxy via routes API Next.js = chantier P2).
+EN PLUS        403 "abonnement requis" porte code=subscription_required ; le
+               front ne redirige vers /subscriptions que dans ce cas.
+TESTS          tests/Support/BuildsRentalData (helpers partages),
+               RoleAccessTest (matrice owner/agent/tenant/admin sur toutes
+               les listes + ecritures), P1FixesTest. ExampleTest pointe sur
+               /up. Suite complete : 36 tests, 122 assertions, verte.
+               Frontend : tsc, eslint (0 erreur), next build OK.
+
+--------------------------------------------------------------------------------
+9. JOURNAL DES CORRECTIONS P2 (2026-10-01)
+--------------------------------------------------------------------------------
+S6    CORRIGE  Proxy serveur Next src/app/backend/[...path]/route.ts : le
+(fin)          token Sanctum reste dans le JWT NextAuth (cookie httpOnly) et
+               n'est plus copie dans la session -> invisible du navigateur.
+               Seul /api/* est relaye ; requetes modifiantes refusees si
+               Origin != app (CSRF). CSP connect-src 'self'. Supprime aussi
+               le getSession() a chaque appel. Verifie de bout en bout
+               (next start + API locale) : session sans token, appel
+               authentifie OK, logout revoque le token puis 401.
+               IP client relayee (X-Forwarded-For) au login et via le proxy ;
+               Laravel trustProxies(TRUSTED_PROXIES, defaut 127.0.0.1,::1)
+               -> limites de debit par client et non globales.
+LIMITES        Subscription::limitReached (null = illimite). Limite de biens
+               a la creation d'un bien, limite de locataires a la creation
+               d'un locataire (parc du bailleur, agents compris).
+               CheckSubscriptionLimitsMiddleware (mort, casse) supprime.
+PAIEMENTS      lockForUpdate sur le loyer, refus d'un loyer deja solde et du
+               sur-paiement (422), quittance generee une seule fois.
+BAUX           GenerateRentForContract : rien apres end_date ; semester /
+               annual factures aux mois anniversaires (hypothese :
+               rent_amount = montant de la periode). Nouvelle commande
+               app:expire-contracts (quotidienne 01:00) : bail expire +
+               bien libere.
+DOCUMENTS      PDF de contrat : chemin propre au document, fichier uploade
+               supprime (plus d'orphelin). shared_with en $fillable (cast
+               array). Etat des lieux : contract_id doit porter sur le bien,
+               plus d'"undefined array key".
+MOMO           Timeouts 15 s, token en cache, indicatif MOMO_COUNTRY_CODE,
+               X-Target-Environment unique, erreurs levees (job rejoue avec
+               backoff, confirm/webhook -> 503 sans activer), paiements
+               "pending" > 48 h clotures au lieu d'etre sondes indefiniment.
+FRONTEND       Intercepteurs Axios ejectes au nettoyage (plus de doublons) ;
+               vrais messages d'erreur au login (identifiants, 429).
+DIVERS         Pagination plafonnee a 100 sur toutes les listes.
+TESTS          P2FixesTest (13). Suite : 49 tests, 161 assertions, verte.
+               Frontend : tsc, eslint (0 erreur), next build OK.
+RESTE          -> traite en section 10.
+
+--------------------------------------------------------------------------------
+10. JOURNAL DES CORRECTIONS - POINTS RESTANTS (2026-10-01)
+--------------------------------------------------------------------------------
+FORMATS API    Controller de base : paginated() -> toutes les listes au
+               format { data, total, page, limit (<=100), totalPages } ;
+               error() -> { status: "error", message, ... } comme le
+               gestionnaire d'exceptions. Applique a Property, Tenant,
+               Contract, Rent, Payment, Document, Inventory (avant : format
+               paginator Laravel -> total toujours vide cote front),
+               middlewares Role/Subscription, MoMo. Les catch qui renvoyaient
+               $e->getMessage() au client relancent l'exception (rendu
+               generique). Ressources corrigees : RentResource (tenant_name
+               lisait tenants.name inexistant), PaymentResource
+               (property_name contenait le nom du BAILLEUR -> owner_name).
+LOYERS         GET /api/rents pagine + recherche ; RentList.tsx reecrit en
+               pagination serveur (la page plantait : .slice sur un objet).
+FACTORIES      Alignees sur le schema, graphe coherent (Payment -> Rent ->
+               Contract -> Tenant(role tenant) -> Property -> owner) ;
+               ContractFactory cree ; SubscriptionFactory depuis
+               config/plans.php.
+SEEDERS        TenantSeeder : chaque locataire a SON compte (avant :
+               tenants.user_id = le bailleur, qui devenait son propre
+               locataire). Plans du catalogue serveur, abonnements pour les
+               bailleurs seulement, AgentOwnerSeeder enfin appele,
+               baux actifs coherents. PropertyTenantSeeder via factories.
+               NB : la base locale actuelle vient de l'ancien seeder (noms de
+               "locataires" = bailleurs) ; migrate:fresh --seed pour repartir
+               de donnees coherentes (destructif).
+APP_DEBUG      Force a false en production (AppServiceProvider + warning) et
+               bloc "debug" jamais rendu en production.
+FRONTEND ENV   .env.example cree ; API_ORIGIN (serveur uniquement) remplace
+               BASE_API_URL / NEXT_PUBLIC_BASE_API_URL (gardes en repli).
+               Toasts d'erreur en double retires (AddTenant/AddInventory).
+TESTS          ApiConventionsTest (formats, plafond, erreurs, debug prod,
+               factories, seeders sur SQLite). Suite : 61 tests, 262
+               assertions, verte. Frontend : tsc, eslint (0 erreur), build OK,
+               verifie de bout en bout via le proxy.
+
+================================================================================
+11. PARCOURS REELS PAR PROFIL + MULTILINGUE (2026-10-01)
+================================================================================
+Methode : environnement isole (SQLite neuve seedee, API :8100, Next build
+:3100), parcours scripte via le vrai chemin (login NextAuth -> proxy /backend)
+pour visiteur/bailleur, locataire, agent, admin ; lecture des menus et pages
+par role. Base et serveurs de dev non touches ; fichiers de test supprimes.
+Constat global : l'API tient les parcours de bout en bout ; l'UI bloque
+(locataire sans menu, agent avec un lien, bailleur sans encaissement).
+Multilingue inexistant.
+
+BUG CRITIQUE
+- Property::$fillable sans 'status' : toute mise a jour du statut du bien
+  est ignoree en silence (ajout locataire -> reste "free", suppression,
+  expiration). Rien n'empeche plusieurs locataires sur un meme bien.
+  Les tests P1/P2 sur ce point passaient a tort (helper de test touche par
+  le meme defaut).
+
+BAILLEUR
+OK  inscription, login, redirection abonnement, plan gratuit, limite de plan,
+    bien + locataire + bail, invitation email, generation loyers, encaissements
+    (sur-paiement refuse), quittance PDF, upload, partage, etat des lieux.
+KO  Dashboard = page d'exemple ("This is a sample page") alors que
+    /api/dashboard renvoie des donnees reelles.
+KO  Aucun ecran d'encaissement (POST /payments jamais appele par l'UI).
+KO  Renttable/Paymenttable : copie-colle, ouvrent AddPropertyDialog, menus
+    d'action inertes.
+KO  Menu "Finances" -> /retard_rents (404) ; my_finance doublon de
+    my_payments.
+KO  Pas de bouton partage document, pas d'edition/suppression de bien,
+    statut du bien absent de PropertyResource.
+KO  Paiement MoMo : aucun retour utilisateur si la demande echoue en tache
+    de fond (non testable sans identifiants).
+
+LOCATAIRE
+OK  lien d'invitation, mot de passe, login ; API : bail, loyers, paiements,
+    documents, etats des lieux (scopes), telechargement quittance, depot
+    justificatif.
+KO  Aucun menu (sidebar vide + dashboard d'exemple).
+KO  Pas de paiement en ligne, pas de profil / changement de mot de passe,
+    pas de demande d'intervention.
+
+AGENT
+OK  scope sur ses bailleurs, dashboard agrege (API), encaissements.
+KO  Menu = "Dashboard Agent" seul -> rien d'utilisable dans l'UI.
+KO  Ne peut pas creer un bien pour un bailleur gere (403 policy) ; pas
+    d'ecran "mes bailleurs".
+
+ADMIN
+OK  vue globale (API), creation d'agent, rattachement agent-bailleurs.
+KO  Menu Biens/Locataires/Loyers seulement : aucun ecran utilisateurs,
+    agents, rattachements, abonnements.
+KO  Mot de passe agent choisi par l'admin (pas d'invitation) ; pas de
+    suspension/edition de compte ; pas de suivi des revenus SaaS ;
+    GET /users hors format de liste commun.
+
+MULTILINGUE FR/EN
+- Front : i18next en/fr/ar/ch, 7 cles du template ("Chip" -> "Ebrecher") ;
+  seuls les menus utilisent t() ; textes en dur FR/EN melanges ; langue par
+  defaut "en" ; langue non transmise a l'API.
+- API : resources/lang copie d'un autre projet (eleves, professeurs), aucun
+  __() ; messages metier FR en dur, validation EN ; emails/relances/PDF FR
+  seulement ; pas de langue par utilisateur.
+
+PLAN
+Phase 1 - Correctifs immediats (<= 1 j)
+  1. 'status' fillable + tests corriges + statut dans PropertyResource.
+  2. Menu Finances, dialogues copies-colles des tableaux du bail, GET /users
+     au format commun.
+Phase 2 - Parcours utilisables (~2 sem)
+  Dashboard reel par role ; encaissement depuis les loyers + partage
+  document ; espace locataire (Mon bail, Mes loyers, Mes documents, EDL) ;
+  agent (pages bailleur reutilisees, "Mes bailleurs", creation de bien pour
+  un bailleur gere) ; admin (utilisateurs, agents/rattachements,
+  abonnements, invitation agents, suspension) ; page profil tous roles.
+Phase 3 - Bilingue FR/EN (~1-2 sem)
+  API : users.locale, detection de langue, lang/fr + lang/en (laravel-lang),
+  __() partout, emails/relances/PDF localises. Front : FR par defaut, retrait
+  ar/ch, traductions par ecran, langue memorisee et transmise par le proxy,
+  formats Intl (XAF). Test CI des cles manquantes.
+Phase 4 - Valeur metier
+  Paiement loyer MoMo par le locataire, tickets d'intervention,
+  notifications in-app/SMS, PDF de bail + signature, revenus SaaS admin.
+
+--------------------------------------------------------------------------------
+12. JOURNAL - PHASE 1 (2026-10-01)
+--------------------------------------------------------------------------------
+STATUT BIEN    'status' ajoute a Property::$fillable (jamais valide depuis la
+               requete). PropertyResource expose status (+ owner null-safe,
+               owner charge en eager loading). Tests renforces : statut
+               "occupied" verifie avant suppression/expiration, nouveau test
+               ajout locataire -> bien occupe -> 2e locataire refuse (409).
+               Contre-epreuve : sans le correctif, 3 tests echouent.
+GET /users     Format de liste commun via paginated() + filtre role + recherche
+               (nom, email, telephone) ; ?limit= au lieu de ?per_page=.
+MENU           Bailleur > Finances : href /retard_rents (404) remplace ;
+               enfants "Loyers" (/rents, jusqu'ici invisible du bailleur) et
+               "Paiements". Page my_finance (doublon de my_payments, filtre
+               date branche sur la recherche texte) supprimee ; fil d'Ariane
+               des etats des lieux corrige.
+TABLEAUX BAIL  Renttable / Paymenttable reecrits : suppression du dialogue
+               d'ajout de BIEN copie-colle (jamais ouvert), du menu d'actions
+               inerte (ancre partagee entre lignes) et de la recherche
+               ignoree par l'API ; libelles et statuts en francais ; fils
+               d'Ariane /my_contrats -> /my_contracts.
+TESTS          63 tests backend verts ; frontend tsc, eslint (0 erreur),
+               next build OK.
+SUITE          Phase 2 (AUDIT §11) : dashboard reel, encaissement depuis les
+               loyers, espace locataire, agent, admin, profil.
+
+--------------------------------------------------------------------------------
+13. JOURNAL - PHASE 2 (2026-10-01)
+--------------------------------------------------------------------------------
+COMMUN         src/utils/roles.ts : permissions UI par role (miroir des
+               policies), useRole(), formatMoney (FCFA).
+DASHBOARD      Page / reelle par role (GET /api/dashboard) : KPI biens,
+               locataires, encaisse/attendu, impayes, taux d'encaissement,
+               loyers en retard ; variante locataire (mon bail, loyer du
+               mois, impayes). API : GET /rents?overdue=1 & ?status=.
+ENCAISSEMENT   RecordPaymentDialog (total/partiel, reste du propose) sur
+               /rents et sur les echeances d'un bail ; bouton Quittance.
+               API : RentResource paid_amount / remaining /
+               receipt_document_id ; documents.rent_id (migration +
+               rattrapage des quittances existantes) ; quittance unique par
+               loyer (updateOrCreate).
+DOCUMENTS      Bouton Partager ; suppression proposee a l'auteur/admin seuls.
+BUGS UI        TenantList / ContractList : menu partage entre toutes les
+               lignes -> un clic pouvait viser une autre ligne (suppression
+               du MAUVAIS locataire possible). Remplace par des boutons par
+               ligne. Entrees inertes retirees (Edit sans API, Contract,
+               Documents). Etats des lieux : bouton Voir (detail des
+               elements) au lieu d'un console.log ; nom du bien lu sur
+               l'etat des lieux et non le bail.
+LOCATAIRE      Menu "Mon espace" (tableau de bord, bail, loyers, paiements,
+               documents, etats des lieux) ; actions bailleur masquees.
+AGENT          Menu complet (pages bailleur, donnees deja scopees par l'API),
+               page "Mes bailleurs". API : creation de bien pour un bailleur
+               gere (PropertyPolicy::createFor, owner_id obligatoire pour
+               agent/admin, abonnement + limite du BAILLEUR). Dialogue
+               d'ajout de bien avec choix du bailleur.
+ADMIN          Menu Administration : Utilisateurs (filtre role, recherche,
+               invitation agent/admin, suspension/reactivation), Agents
+               (portefeuille : rattacher/retirer), Abonnements (liste +
+               revenus du mois/cumules, actifs par plan). API : invitation
+               par lien (plus de mot de passe choisi par l'admin),
+               users.suspended_at (login refuse, tokens revoques),
+               DELETE agents/{id}/owners/{owner}, GET /admin/subscriptions,
+               GET agents/{id}/owners ouvert a l'admin.
+PROFIL         /profile pour tous les roles : coordonnees (role/email non
+               modifiables) et mot de passe (actuel requis, autres sessions
+               deconnectees). API : GET/PUT /me, PUT /me/password.
+               Menu d'en-tete : entrees factices remplacees par "Mon profil".
+DIVERS         Login sur le guard "web" explicite ; Property.status = free
+               par defaut cote modele ; bien occupe verifie avant les limites
+               (409 explicite).
+TESTS          Phase2Test, AdminTest, ProfileTest : 76 tests, 357
+               assertions, verts. Front : tsc, eslint (0 erreur), build OK.
+PARCOURS       Rejoue sur environnement isole (SQLite, API :8100, Next :3100)
+               via NextAuth + proxy : 45/45 etapes OK pour bailleur,
+               locataire, agent, admin. Fichiers de test supprimes.
+A NOTER (ph.3) L'email d'invitation est l'email Laravel standard "Reset
+               Password", en anglais : a remplacer par une vraie invitation
+               localisee (FR/EN).
+MIGRATIONS     A executer : php artisan migrate (3 en attente :
+               subscriptions, documents.rent_id, users.suspended_at).
+
+--------------------------------------------------------------------------------
+14. JOURNAL - PHASE 3 : BILINGUE FR/EN (2026-10-01)
+--------------------------------------------------------------------------------
+API            lang/fr + lang/en : validation/auth/passwords/pagination (FR
+               officiel extrait de laravel-lang/lang, MIT, sans nouvelle
+               dependance), messages.php (tous les messages metier),
+               notifications.php, pdf.php, noms de champs de validation,
+               fr.json (textes du gabarit d'email Laravel). Ancien
+               resources/lang (copie d'un autre projet) supprime.
+               users.locale (fr par defaut) ; middleware SetLocale :
+               Accept-Language > preference utilisateur > app.locale (fr).
+               Gestionnaire d'exceptions traduit (y compris 403/429 du
+               framework). PUT /me accepte locale ; login renvoie locale.
+               Contrôles console, mock de paiement local et reponses au
+               webhook MoMo volontairement non traduits (non visibles).
+EMAILS         AccountInvitation remplace "Reset Password" pour locataires et
+               personnel : broker "invitations" (table
+               account_invitation_tokens, lien 72 h, invitation=1), jamais
+               interchangeable avec un lien de reinitialisation (60 min).
+               Relances et invitation envoyees dans la langue du destinataire
+               (User implements HasLocalePreference).
+PDF            Bail et quittance traduits, generes dans la langue du
+               locataire ; titre du document ("Quittance"/"Receipt")
+               localise ; montants formates.
+FRONT          Instance i18next par arbre React (pas de singleton partage en
+               SSR), langue lue dans le cookie "locale" par le layout serveur
+               (<html lang> correct au 1er rendu). FR par defaut ; ar/ch
+               retires. Selecteur : cookie + profil (PUT /me). LocaleSync :
+               preference du compte appliquee a la connexion si aucun choix
+               sur l'appareil. Proxy /backend et login NextAuth transmettent
+               Accept-Language. useFormat() : montants (FCFA/XAF) et dates
+               selon la langue. 325 cles, tous les ecrans traduits (menus,
+               auth, dashboard, listes, dialogues, admin, profil, PDF).
+BUGS CORRIGES  Login : message d'erreur fige ("Username or Password is
+               Wrong") au lieu du vrai message ; case "Remember" factice.
+               Inscription : mot de passe affiche en clair (type text) ;
+               boutons Google/GitHub factices. Etat d'un element d'EDL en
+               texte libre alors que la base impose un enum (erreur SQL) ->
+               liste fermee + regle API. Ajout locataire : seuls les biens
+               libres sont proposes. Widgets factices du template retires de
+               l'en-tete (notifications de demo, recherche, applis,
+               "Welcome to Modernize").
+CONTROLES      Back : tests/Unit/TranslationParityTest (memes fichiers, cles
+               et parametres en fr/en), LocalizationTest (en-tete, preference,
+               erreurs framework, profil, invitation, tokens non
+               interchangeables, 72 h, quittance/relance dans la langue du
+               locataire). Front : npm run i18n:check (parite fr/en,
+               variables, cles utilisees et groupes dynamiques existants),
+               contre-epreuve OK.
+RESULTATS      85 tests backend verts ; tsc, eslint (0 erreur), next build,
+               i18n:check OK. Parcours reels sur environnement isole : 9/9
+               bilingue + 45/45 phase 2.
+A FAIRE        .env local : APP_LOCALE=en -> fr (defaut produit).
+               Migrations en attente : php artisan migrate (5).
+
+################################################################################
+#                    AUDIT INITIAL DU 2026-09-16 (historique)                  #
+################################################################################
+
+================================================================================
+AUDIT COMPLET - SaaS Gestion Locative (Laravel "locative" + Next.js "Frontend")
+Date : 2026-09-16
+Perimetre analyse : backend Laravel (routes, controllers, middlewares, models,
+migrations, config) et frontend Next.js (App Router, auth, services API,
+structure des pages).
+================================================================================
+
+--------------------------------------------------------------------------------
+0. CONSTATS CRITIQUES IMMEDIATS (a corriger avant toute autre chose)
+--------------------------------------------------------------------------------
+Ce ne sont pas des recommandations theoriques : ce sont des failles presentes
+et exploitables dans le code lu.
+
+#1  Fichier   : routes/web.php:10 + FrontController::confirmPayment
+    Faille    : Route PUBLIQUE, non authentifiee, POST /payment/confirm/{ref}
+                qui marque le paiement "success" ET active l'abonnement, sans
+                aucune verification de signature/montant venant du fournisseur
+                de paiement (MoMo/Stripe). La "reference" (UUID) est renvoyee
+                telle quelle au frontend dans SubscriptionController::store.
+    Impact    : N'importe quel utilisateur peut activer gratuitement
+                n'importe quel plan (y compris "Agency") sans payer.
+
+#2  Fichier   : routes/api.php:19-20
+    Faille    : POST /users est une route PUBLIQUE (hors auth:sanctum) qui
+                accepte 'role' => $request->role SANS restriction de valeur
+                dans UserController::store.
+    Impact    : N'importe qui peut creer un compte avec role: "admin" ->
+                prise de controle totale de la plateforme, sans
+                authentification prealable.
+
+#3  Fichier   : bootstrap/app.php
+    Faille    : L'alias de middleware "role" (utilise dans routes/api.php:59,67
+                via role:admin, role:agent) n'est JAMAIS declare dans
+                withMiddleware(). Seuls check.limit et subscription le sont.
+    Impact    : Toutes les routes admin/agent (/agents/{id}/assign-owners,
+                /admin/documents, /admin/properties, /agents/{id}/owners)
+                plantent en 500 ("Target class [role] does not exist"). Le
+                RBAC "role" est totalement non fonctionnel en l'etat.
+
+#4  Fichier   : SubscriptionController::store
+    Faille    : Le prix de l'abonnement est fourni par le CLIENT
+                ('price' => 'required|numeric|min:0') sans reference a un
+                catalogue serveur.
+    Impact    : Un utilisateur peut souscrire au plan "Pro" en envoyant
+                price: 0.01. Aucune source de verite serveur pour les plans.
+
+#5  Fichier   : SubscriptionController::callback + routes/api.php:33
+    Faille    : Callback de paiement place derriere auth:sanctum simple (pas
+                de verification que l'appelant est le fournisseur de
+                paiement, ni que le paiement lui appartient) :
+                SubscriptionPayment::where('reference', $reference)->first()
+                sans scoping.
+    Impact    : N'importe quel utilisateur connecte peut forger un succes de
+                paiement pour n'importe quelle reference devinee/interceptee.
+
+#6  Fichier   : Frontend/src/app/api/auth/[...nextauth]/options.ts:59-61
+    Faille    : Secret NextAuth avec fallback en dur commite dans le code
+                source : process.env.NEXTAUTH_SECRET || "kvwLrfri/...".
+    Impact    : Si la variable d'env n'est pas positionnee en prod (oubli
+                frequent, cf. .env.example = placeholder), n'importe qui
+                lisant le repo peut forger des sessions JWT valides ->
+                usurpation de n'importe quel compte.
+
+#7  Fichier   : TenantController::store
+    Faille    : IDOR - Property::findOrFail($validated['property_id']) sans
+                verifier que la propriete appartient au proprietaire/agent
+                authentifie. Aucune policy.
+    Impact    : Un owner A peut creer un locataire (et donc un contrat) sur
+                un bien du owner B en connaissant/devinant son property_id.
+
+#8  Fichier   : TenantController::store + Frontend AddTenantDialog.tsx
+    Faille    : Le mot de passe du compte locataire est choisi et transmis
+                par le bailleur/agent a la creation ('password' =>
+                'required|string|min:6' dans la requete du owner), sans flux
+                d'invitation. Confirme visuellement par le champ "Mot de
+                passe" saisi par le bailleur dans AddTenantDialog.tsx.
+    Impact    : Le bailleur connait (ou choisit) le mot de passe de son
+                locataire -> violation de confidentialite fondamentale.
+
+#9  Fichier   : DocumentController::index
+    Faille    : Filtre locataire : $q->where('tenant_id', $user->id) sur
+                contracts.tenant_id, qui reference tenants.id et NON
+                users.id (confirme par la migration).
+    Impact    : Bug d'autorisation : un locataire ne voit jamais ses vrais
+                documents, ou pire, en voit d'autres selon coincidence d'ID.
+
+#10 Fichier   : DocumentController::store
+    Faille    : Fichiers (y compris CNI/passeport potentiellement) stockes
+                sur disk('public'), donc servis en clair, sans URL signee,
+                sans expiration, sans controle d'acces au telechargement.
+    Impact    : Toute personne connaissant/devinant l'URL du fichier peut le
+                recuperer - pieces d'identite et baux potentiellement
+                exposes publiquement. Probleme RGPD.
+
+#11 Fichier   : app/Console/Commands/getStatusMomo.php,
+                app/Http/Controllers/UserController.php
+    Faille    : Reference App\Models\PointSale et App\Models\Paiement,
+                modeles INEXISTANTS dans ce projet - copie-colle non
+                nettoyee d'un autre projet (POS/restaurant). Idem
+                UserController::index/dashboardServer reference Order,
+                Table et le message "Impossible de charger les commandes".
+    Impact    : La commande de reconciliation MoMo plante immediatement
+                (Class not found). Preuve que le depot contient du code
+                copie d'un starter/template sans nettoyage.
+
+#12 Fichier   : routes/web.php:7
+    Faille    : MomoCallbackController reference mais jamais importe /
+                n'existe pas.
+    Impact    : Toute requete vers /momo/callback crashe en 500.
+
+#13 Fichier   : app/Models/User.php
+    Faille    : "use Illuminate\Database\Eloquent\SoftDeletes;" importe mais
+                jamais active (trait absent de la classe), combine a
+                onDelete('cascade') sur properties, tenants, contracts,
+                payments.
+    Impact    : Supprimer un utilisateur efface en cascade et
+                definitivement biens, locataires, contrats et paiements -
+                aucune retention legale possible.
+
+#14 Fichier   : routes/api.php:53
+    Faille    : Route::middleware('subscription:pro') - mais aucune valeur
+                'pro' n'existe dans un catalogue de plans canonique (nom de
+                plan libre cote client, cf #4).
+    Impact    : Controle d'acces aux fonctionnalites "Pro" fragile /
+                contournable en jouant sur le nom de plan envoye a la
+                creation.
+
+#15 Fichier   : ContractController
+    Faille    : apiResource('contracts', ...) declare 5 routes REST mais
+                seule index() est implementee.
+    Impact    : POST/GET(id)/PUT/DELETE /contracts/* renvoient une
+                BadMethodCallException (500).
+
+#16 Fichier   : PaymentController::show/update/destroy
+    Faille    : Signatures (Rent $rent) alors que la route generee par
+                apiResource('payments', ...) est /payments/{payment} -> le
+                binding implicite Laravel echoue silencieusement.
+    Impact    : Copie-colle de RentController non adapte ; endpoints casses.
+
+RECOMMANDATION IMMEDIATE : geler tout deploiement en production tant que
+#1 a #9 ne sont pas corriges. Ce sont des vulnerabilites de niveau "compte
+admin gratuit" et "abonnement gratuit", pas des defauts cosmetiques.
+
+--------------------------------------------------------------------------------
+1. MANQUEMENTS FONCTIONNELS (Gestion Locative Avancee)
+--------------------------------------------------------------------------------
+
+BAUX & QUITTANCES
+- Contract existe mais AUCUNE generation de quittance PDF n'est presente.
+- App\Console\Commands\GenerateRent::handle() est VIDE (variable meme
+  jamais utilisee). C'est le coeur du metier et il n'existe pas.
+- Aucune revision legale du loyer (indices IRL/INSEE).
+- Aucune regularisation des charges (prorata, charges reelles vs
+  provisionnees).
+- Pas de prorata temporis a l'entree/sortie.
+
+Exemple de code a construire :
+
+  // app/Console/Commands/GenerateMonthlyRents.php
+  public function handle()
+  {
+      Contract::where('status', 'active')
+          ->chunkById(200, function ($contracts) {
+              foreach ($contracts as $contract) {
+                  GenerateRentForContract::dispatch($contract); // Job en queue
+              }
+          });
+  }
+
+  // app/Jobs/GenerateRentForContract.php
+  public function handle(): void
+  {
+      $rent = $this->contract->rents()->firstOrCreate(
+          ['month' => now()->format('Y-m')],
+          ['due_date' => now()->startOfMonth()->addDays(4),
+           'amount' => $this->contract->rent_amount, 'status' => 'pending']
+      );
+      GenerateRentReceiptPdf::dispatch($rent)->onQueue('pdf');
+  }
+
+  Planifie via routes/console.php (Schedule::command('app:generate-rent')
+  ->monthlyOn(1, '02:00')) - actuellement AUCUN scheduler n'est configure.
+
+IMPAYES & RECOUVREMENT
+- Rien : pas de relances automatiques (J+3/J+7/J+15), pas de calcul de
+  penalites de retard, pas de mise en demeure, pas de suivi de litiges.
+  Le champ rents.status a une valeur "late" mais rien ne la calcule ni ne
+  reagit dessus.
+
+MAINTENANCE & INCIDENTS
+- Aucun modele Ticket/Incident, aucun workflow locataire -> proprietaire ->
+  artisan. Absent a 100%.
+
+COMPTABILITE & FISCALITE
+- Aucun export FEC, aucune aide LMNP/revenus fonciers, aucun rapprochement
+  bancaire. Le modele Payment (method: cash|bank|mobile) n'a meme pas de
+  lien vers un releve bancaire importe.
+
+MULTI-ROLES / MULTI-TENANCY
+- Partiel : "role" en enum texte libre sur User (owner, agent, admin,
+  tenant deduits du code, mais pas de contrainte DB, pas d'enum PHP), et
+  chaque controleur reimplemente son propre if ($user->role === 'owner')
+  ..., duplique a l'identique dans PropertyController, TenantController,
+  ContractController, PaymentController (copie-colle, divergences deja
+  visibles - DocumentController a une logique differente et buguee).
+- Pas de portail "Prestataire/Artisan" du tout.
+- Le modele agence multi-proprietaire (agent_owner pivot) existe en DB mais
+  AgentController est une CLASSE VIDE - fonctionnalite annoncee dans les
+  routes mais non implementee.
+
+PRIORITE #1 ARCHITECTURE : extraire cette logique de scoping par role dans
+des Policies Laravel + un scope global sur les modeles, au lieu de la
+dupliquer a la main dans chaque controleur.
+
+  // app/Policies/PropertyPolicy.php
+  public function view(User $user, Property $property): bool
+  {
+      return match($user->role) {
+          'admin' => true,
+          'owner' => $property->user_id === $user->id,
+          'agent' => $user->owners->pluck('id')->contains($property->user_id),
+          default => false,
+      };
+  }
+
+--------------------------------------------------------------------------------
+2. SECURITE & CONFORMITE
+--------------------------------------------------------------------------------
+
+BACKEND LARAVEL
+- IDOR confirme sur Tenant, Inventory (aucun filtre par role dans
+  index()/show()/compareInventories() - n'importe quel abonne actif voit
+  les etats des lieux de n'importe quel autre bailleur), et potentiellement
+  Document.
+- Mass assignment : UserController::store liste les champs explicitement
+  (pas de mass-assignment technique), MAIS accepte "role" en clair depuis
+  le client sans liste blanche - fonctionnellement la meme faille
+  (elevation de privilege).
+- Aucune Policy/Gate nulle part dans le projet - tout est en "if" disperses,
+  impossible a auditer de facon centralisee (deja oublie sur Inventory,
+  Rent::index() qui fait Rent::all() sans aucun filtre).
+- Chiffrement des donnees sensibles : document_id (numero CNI/passeport),
+  aucune donnee bancaire (IBAN) n'a de cast "encrypted". Il n'existe meme
+  pas de champ IBAN pour les virements aux proprietaires.
+- Rate limiting : SecurityController::login n'a aucun throttle -> brute
+  force possible. Pas de verrouillage de compte, pas de 2FA.
+- Validation : UserController::store ne valide pas "password" du tout ->
+  Hash::make($request->password) peut hasher null.
+- env() utilise en dehors de config (UserController::store: env('APP_URL'))
+  - casse des que "php artisan config:cache" est utilise en production.
+- CORS : aucun config/cors.php present dans le projet - a
+  verifier/publier explicitement et restreindre allowed_origins.
+- APP_DEBUG=true en .env local - s'assurer que ce n'est jamais true en
+  production.
+
+FRONTEND NEXT.JS
+- Secret NextAuth en dur (cf #6) : a supprimer immediatement, forcer
+  NEXTAUTH_SECRET obligatoire (throw si absent).
+- Le token API Sanctum transite dans le JWT de session NextAuth
+  (options.ts: token.token = user.token puis expose via session.token).
+  Avec la strategie jwt, getSession() cote client renvoie ce token brut en
+  clair a tout script JS de la page -> toute XSS sur le frontend vole
+  directement le bearer token de l'API.
+- Fallback localStorage.getItem("access_token") (currentToken.ts) :
+  stockage explicite d'un token en localStorage, directement lisible par
+  n'importe quel script -> vecteur de vol de session par XSS.
+- Frontend/src/utils/axios.js : appelle useSnackbar() (un hook React) EN
+  DEHORS d'un composant, dans un intercepteur Axios cree au niveau module
+  -> crash garanti ("Invalid hook call") au premier echec reseau. Et
+  import {redirect} from "next" n'est pas un export valide de "next" pour
+  un usage client. Fichier legacy a supprimer (deux instances Axios
+  concurrentes = bugs d'incoherence garantis).
+- Aucun middleware.ts a la racine du frontend. La seule protection des
+  routes (DashboardLayout)/* est un check "if (session) {...} else
+  redirect(...)" execute COTE CLIENT via useSession() dans layout.tsx.
+
+RGPD / CONFORMITE
+- Aucun mecanisme d'anonymisation/suppression des donnees locataires apres
+  depart (le cascade delete existant est en fait l'inverse : suppression
+  brutale, pas conforme a l'obligation de conservation legale des
+  baux/quittances plusieurs annees).
+- Aucune gestion de consentement, ni registre de traitement.
+- Documents d'identite stockes sans URL signee ni expiration.
+- Recommandation : disque S3/MinIO prive + Storage::disk('s3')
+  ->temporaryUrl($path, now()->addMinutes(5)), journal d'acces aux
+  documents sensibles, politique de retention avec purge automatique apres
+  le delai legal.
+
+--------------------------------------------------------------------------------
+3. ARCHITECTURE & PERFORMANCES
+--------------------------------------------------------------------------------
+
+LARAVEL
+- Pas de queue effectivement utilisee : QUEUE_CONNECTION=database est
+  configure mais AUCUN Job n'existe dans app/Jobs (dossier absent). Tout
+  est fait de facon synchrone dans les controleurs (generation PDF dans
+  DocumentController::store, appels HTTP externes MoMo synchrones dans
+  MomoService).
+- N+1 non traites : PaymentController::index charge
+  rent.contract.property.owner (bien) mais RentController::index fait
+  Rent::all() sans with().
+- Pas d'Events/Listeners : la creation d'un paiement reussi devrait
+  declencher un evenement (PaymentReceived) ecoute par des listeners
+  decouples.
+- Resources partiellement utilisees (bon point globalement), mais
+  DocumentController::index renvoie du brut sans Resource -> fuite
+  potentielle de champs internes.
+- API versioning : aucun prefixe v1/ dans routes/api.php.
+- Gestion d'erreur unifiee : chaque controleur retourne un format
+  different (Helpers::success/error, response()->json(['error'=>...])
+  brut, format different dans SecurityController). Besoin d'un
+  Handler/ApiResponse unique et de FormRequest par action.
+
+NEXT.JS
+- Store Redux existant mais usage non audite en detail - a verifier que
+  l'etat serveur n'est pas duplique inutilement plutot que gere par un
+  cache de requetes (React Query/SWR).
+- Pas de signe de Server Components utilises pour le fetch de donnees
+  protegees - tout semble passer par Axios cote client.
+- react-hook-form + yup installes mais non utilises de facon coherente
+  (ex: AddTenantDialog gere son formulaire a la main en useState).
+- Pas de PWA/mode hors-ligne - non critique en V1 mais a prevoir pour les
+  etats des lieux mobiles.
+- next.config.mjs : reactStrictMode desactive, aucun header de securite
+  (CSP, X-Frame-Options, Referrer-Policy) configure.
+
+COMMUNICATION API
+- Webhooks paiement : voir faille critique #1/#5 - a reconstruire
+  entierement avec verification de signature HMAC du fournisseur.
+- Pas d'idempotency key sur les endpoints de paiement -> double soumission
+  possible.
+
+--------------------------------------------------------------------------------
+4. PAIEMENTS & INTEGRATIONS TIERCES
+--------------------------------------------------------------------------------
+- MomoService existe et suit un flux correct de token OAuth + requestToPay,
+  MAIS :
+  - Le callback (X-Callback-Url = route('momo.callback')) pointe vers un
+    controleur (MomoCallbackController) qui n'existe pas dans le code
+    (#12) - le webhook reel de MTN MoMo n'est donc jamais traite.
+  - getStatusMomo (commande de reconciliation par polling) reference des
+    modeles inexistants (#11) - inutilisable en l'etat.
+- Pas de SEPA/carte bancaire - marche cible probable Afrique francophone
+  (XAF, MTN MoMo) - a completer avec Orange Money en complement si le
+  marche cible est le Cameroun/CEMAC.
+- Pas de signature electronique de bail (Yousign/DocuSign) - les contrats
+  sont juste des enregistrements DB + PDF simple genere cote serveur, non
+  opposables juridiquement en cas de litige.
+- Pas de notification SMS/WhatsApp/email transactionnel configuree
+  (MAIL_MAILER=log en local).
+
+Exemple de securisation du paiement :
+
+  // Remplacer FrontController::confirmPayment par un vrai webhook signe :
+  Route::post('/momo/callback', [MomoWebhookController::class, 'handle'])
+      ->name('momo.callback');
+
+  class MomoWebhookController
+  {
+      public function handle(Request $request)
+      {
+          // 1. Verifier la signature/l'origine
+          $referenceId = $request->input('referenceId');
+          $payment = SubscriptionPayment::where('reference', $referenceId)
+              ->firstOrFail();
+
+          // 2. Revérifier activement le statut aupres de MoMo (source de
+          //    verite), pas le body recu
+          $status = app(MomoService::class)->getPaymentStatus($referenceId);
+
+          if (($status['status'] ?? null) === 'SUCCESSFUL'
+              && $payment->status !== 'success') {
+              DB::transaction(function () use ($payment) {
+                  $payment->update(['status' => 'success']);
+                  $payment->subscription->update(['status' => 'active']);
+              });
+              SubscriptionActivated::dispatch($payment->subscription);
+          }
+      }
+  }
+
+Et supprimer purement et simplement la route payment.confirm publique, ou
+la reserver strictement a l'environnement local/testing.
+
+--------------------------------------------------------------------------------
+5. UX & FACTEURS CLES DE SUCCES (le "moat")
+--------------------------------------------------------------------------------
+1. Scoring IA du dossier locataire : upload des justificatifs (fiches de
+   paie, avis d'imposition) -> extraction automatique (OCR + LLM) du
+   revenu, calcul du taux d'effort, detection d'incoherences/doublons ->
+   score de solvabilite instantane pour le bailleur.
+2. Tableau de bord de rentabilite nette temps reel : loyers encaisses -
+   charges - vacance - impayes - travaux, par bien et consolide, avec
+   projection fiscale. La donnee brute existe deja (Property/Payment/Rent),
+   il manque juste l'agregation (DashboardController::dashboard() est
+   actuellement vide).
+3. Pre-etat des lieux assiste par photo/IA : le modele Inventory/
+   InventoryItem existe deja en base - coupler a une capture photo mobile
+   avec comparaison automatique entree/sortie (compareInventories() existe
+   deja en embryon dans InventoryController).
+4. Relances intelligentes multicanal (SMS + WhatsApp + email) avec ton
+   adaptatif selon l'historique du locataire, et proposition automatique
+   d'echeancier avant procedure contentieuse.
+5. Marketplace de prestataires integree au module maintenance (devis, mise
+   en concurrence, paiement direct) - source de revenu additionnelle
+   (commission) au-dela du SaaS pur.
+
+--------------------------------------------------------------------------------
+6. PLAN D'ACTION - MATRICE IMPACT / EFFORT
+--------------------------------------------------------------------------------
+
+PRIORITE          | ITEM                                            | IMPACT   | EFFORT      | STATUT ACTUEL
+------------------+-------------------------------------------------+----------+-------------+------------------
+P0 (bloquant secu)| Supprimer/securiser payment.confirm public (#1) | Critique | Faible      | Faille active
+P0                | Restreindre POST /users (role non libre) (#2)   | Critique | Faible      | Faille active
+P0                | Declarer l'alias middleware role (#3)           | Critique | Trivial     | Casse (500)
+P0                | Catalogue de plans cote serveur (#4)            | Critique | Faible      | Faille active
+P0                | Scoper callback paiement + vraie verif (#5)     | Critique | Moyen       | Faille active
+P0                | Retirer le secret NextAuth en dur (#6)          | Critique | Trivial     | Faille active
+P0                | Policies Laravel (IDOR) (#7, #9)                | Critique | Moyen       | Absent
+P0                | Flux d'invitation locataire (#8)                | Critique | Moyen       | Absent
+P0                | Nettoyer le code copie-colle d'un autre projet  | Eleve    | Faible      | Present
+------------------+-------------------------------------------------+----------+-------------+------------------
+P1 (must-have V1) | Job GenerateMonthlyRents + quittances PDF       | Tres eleve| Moyen      | Vide
+P1                | Documents sur disque prive + URLs signees       | Eleve    | Faible-Moyen| Public en clair
+P1                | Relances impayes (J+3/J+7/J+15) + penalites     | Tres eleve| Moyen      | Absent
+P1                | Completer AgentController                       | Moyen    | Faible      | Classe vide
+P1                | Uniformiser reponses API + FormRequest + v1/    | Moyen    | Moyen       | Incoherent
+P1                | Dashboard de rentabilite reel                   | Eleve    | Moyen       | Vide
+------------------+-------------------------------------------------+----------+-------------+------------------
+P2 (nice-to-have  | Signature electronique (Yousign)                | Eleve    | Eleve       | Absent
+V2)                | Export FEC / aide fiscale LMNP                  | Moyen    | Eleve       | Absent
+                   | Scoring IA dossier locataire                    | Tres eleve| Eleve      | Absent
+                   | Module maintenance/tickets + marketplace        | Eleve    | Eleve       | Absent
+                   | PWA / mode hors-ligne etat des lieux            | Moyen    | Moyen       | Absent
+                   | 2FA, verrouillage de compte, audit log RGPD     | Eleve    | Moyen       | Absent
+
+================================================================================
+ANNEXE A - AUDIT FRONTEND DETAILLE (Next.js)
+================================================================================
+
+A. SECURITE FRONTEND - confirmations et nouveaux constats
+
+F1  Fichier : (absence de middleware.ts)
+    Constat : Aucun middleware.ts a la racine. La seule protection des
+    routes (DashboardLayout)/* est le check "if (session) {...} else
+    redirect('/auth/login')" dans layout.tsx:48-98, execute COTE CLIENT via
+    le hook useSession(). Un utilisateur non authentifie recoit quand meme
+    le bundle JS de la page avant la redirection.
+
+F2  Fichier : AuthRegister.tsx:29-72
+    Constat : Le formulaire d'inscription propose un <Select> limite a
+    owner/agent (accountTypes) - mais c'est un simple leurre cote UI.
+    Comme POST /users ne restreint rien cote serveur (finding backend #2),
+    il suffit d'intercepter la requete reseau et de changer role: "owner"
+    en role: "admin" pour obtenir un compte administrateur.
+
+F3  Fichier : AuthRegister.tsx:40
+    Constat : redirect("/") appele alors que redirect n'est jamais importe
+    dans le fichier -> ReferenceError en execution des qu'un utilisateur
+    deja connecte ouvre /auth/register. Page cassee.
+
+F4  Fichier : AuthRegister.tsx:25,61
+    Constat : import {Router} from "next/router" (API Pages Router) utilise
+    dans une app App Router (Next 14), puis "await Router.push(...)" hors
+    contexte de composant -> ne fonctionnera pas comme attendu. Il faut
+    useRouter de next/navigation.
+
+F5  Fichier : currentToken.ts + options.ts
+    Constat : Token API expose via getSession() cote client + fallback
+    localStorage -> vol de token trivial en cas de XSS. Aucune CSP definie
+    dans next.config.mjs pour reduire ce risque en defense en profondeur.
+
+F6  Fichier : next.config.mjs
+    Constat : reactStrictMode: false et aucun header de securite
+    (Content-Security-Policy, X-Frame-Options, Referrer-Policy) configure
+    via headers().
+
+B. QUALITE DE CODE / DETTE TECHNIQUE FRONTEND
+
+F7  Fichier : axios.js vs axiosServices.ts
+    Constat : Deux instances Axios concurrentes et incoherentes coexistent.
+    axios.js appelle useSnackbar() en dehors d'un composant React dans son
+    intercepteur -> crash "Invalid hook call" au premier appel API en
+    erreur via ce fichier. A supprimer, ne garder que axiosServices.ts.
+
+F8  Fichier : tenantService.ts:140-152
+    Constat : rentService.create/update/remove pointent tous vers
+    /api/tenants... au lieu de /api/rents... - copie-collee non adaptee,
+    miroir exact du bug cote backend. Le module "loyers" est casse de bout
+    en bout, frontend compris.
+
+F9  Fichier : tenantService.ts (interfaces)
+    Constat : Tenant, Payment etc. ne correspondent pas aux payloads reels
+    envoyes (AddTenantDialog envoie password, profession, start_date...
+    absents de l'interface Tenant) ni a l'enum reel du backend
+    (Payment.status type "number" alors que Laravel renvoie
+    'success'|'failed'|'pending'). TypeScript n'apporte quasiment aucune
+    garantie ici.
+
+F10 Fichier : Structure de routes
+    Constat : Duplication complete : (DashboardLayout)/properties,
+    /tenants, /rents ET (DashboardLayout)/(owner)/my_properties,
+    /my_tenants, /my_payments couvrent le meme domaine. Ressemble a un
+    refactor "ajout du groupe (owner)" jamais termine.
+
+F11 Fichier : AddTenantDialog.tsx
+    Constat : Formulaire multi-etapes gere a la main (useState +
+    validations if) alors que react-hook-form + yup sont deja des
+    dependances installees et inutilisees ici.
+
+F12 Fichier : (DashboardLayout)/page.tsx, DashboardController::dashboard()
+    Constat : Dashboard = page vitrine statique des deux cotes ("This is a
+    sample page" / []). Aucune donnee reelle affichee.
+
+F13 Fichier : Sidebar (menu/admin.ts, agent.ts, owner.ts)
+    Constat : Les menus par role existent, mais pas de pages dediees
+    admin/* ou agent/* sous (DashboardLayout) - seulement (owner)/* et les
+    routes racine generiques. Decalage probable entre navigation annoncee
+    et pages reellement livrees pour les roles agent/admin.
+
+C. UX
+
+- Formulaire de creation de locataire en 3 etapes bien pense dans l'idee,
+  mais le champ "Mot de passe" saisi par le bailleur au step 0 confirme
+  visuellement le probleme produit souleve en #8.
+- Chargement de limit: 100 proprietes dans l'Autocomplete sans recherche
+  serveur - ne passera pas a l'echelle pour un gestionnaire multi-
+  biens/agence.
+- Pas de skeleton/etat de chargement coherent au-dela de CircularProgress
+  ponctuel ; pas de gestion d'erreur reseau visible au niveau page.
+
+================================================================================
+ANNEXE B - PLAN GLOBAL CONSOLIDE (backend + frontend)
+================================================================================
+
+Vision en 4 phases, dans l'ordre ou elles doivent etre executees - chaque
+phase est un pre-requis de la suivante.
+
+PHASE 0 - CONFINEMENT SECURITE (avant tout, 3-5 jours)
+Aucune fonctionnalite nouvelle. Objectif : rendre l'existant non
+exploitable.
+1. bootstrap/app.php : declarer l'alias role manquant.
+2. POST /users : retirer du public, ou forcer role en whitelist serveur
+   (owner uniquement en auto-inscription ; agent/admin crees uniquement
+   par un admin authentifie via une route dediee).
+3. Supprimer/neutraliser FrontController::confirmPayment en production
+   (abort(404) hors env local).
+4. SubscriptionController : plans definis cote serveur (table/config
+   plans), ne plus accepter price du client ; callback scope a
+   l'utilisateur + verification active du statut aupres de MoMo.
+5. NEXTAUTH_SECRET : supprimer le fallback en dur, throw au boot si
+   absent.
+6. Policies Laravel pour Property, Tenant, Contract, Inventory, Document -
+   remplacer les if ($user->role === ...) dupliques.
+7. Documents : passage sur disque prive + URLs signees temporaires.
+8. Purger le code copie-colle mort (Order, Table, Paiement, PointSale,
+   MomoCallbackController, axios.js, routes (DashboardLayout)/properties|
+   tenants|rents dupliquees si (owner)/* est la version cible).
+
+PHASE 1 - FONDATIONS PROPRES (2-3 semaines)
+Rendre le socle fiable avant d'empiler des fonctionnalites dessus.
+- FormRequest dediees + reponses API unifiees.
+- Flux d'invitation locataire (email + definition de mot de passe
+  autonome).
+- middleware.ts Next.js (protection serveur des routes par role) +
+  suppression du double axios + alignement des types TS sur les vraies
+  reponses API.
+- Trancher la duplication properties/ vs (owner)/my_properties/ (et
+  equivalents) - un seul arbre de verite.
+- Queues/Jobs actives pour tout ce qui est lent ou externe (upload PDF,
+  appel MoMo).
+- CORS explicite, headers de securite Next.js, rate limiting login.
+
+PHASE 2 - COEUR METIER V1 (4-6 semaines)
+C'est le moment ou le produit devient reellement utilisable par un vrai
+bailleur.
+- GenerateMonthlyRents (job planifie) + generation de quittances PDF.
+- Relances impayes (J+3/J+7/J+15) + penalites de retard.
+- Dashboard de rentabilite reel.
+- Module AgentController complete (multi-proprietaires reellement
+  fonctionnel).
+- Webhook MoMo reel et securise (remplace le mock public).
+
+PHASE 3 - DIFFERENCIATION V2 (au-dela, priorisable selon traction
+commerciale)
+- Signature electronique (Yousign/DocuSign), export comptable FEC,
+  scoring IA dossier locataire, module maintenance/tickets + marketplace
+  prestataires, PWA etat des lieux, 2FA/audit log RGPD.
+
+RECOMMANDATION DE DEMARRAGE
+Compte tenu de la gravite des failles Phase 0 (abonnement gratuit, compte
+admin libre, RBAC casse), il est recommande de commencer par les 8 points
+de la Phase 0, en priorite absolue sur les points #1, #2 et #3 qui
+permettent une compromission complete en un seul appel HTTP.
+
+================================================================================
+FIN DU DOCUMENT
+================================================================================
